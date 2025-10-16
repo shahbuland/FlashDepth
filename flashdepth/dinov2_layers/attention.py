@@ -14,6 +14,8 @@ import torch
 from torch import Tensor
 from torch import nn
 
+# Enable PyTorch's Flash Attention backend for scaled_dot_product_attention
+torch.backends.cuda.enable_flash_sdp(True)
 
 logger = logging.getLogger("dinov2")
 
