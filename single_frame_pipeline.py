@@ -37,8 +37,12 @@ import torch.nn.functional as F
 from PIL import Image
 import matplotlib.pyplot as plt
 
-from flashdepth.model import FlashDepth
-from dataloaders.depthanything_preprocess import depthanything_preprocess
+# Enable PyTorch Flash Attention backend for better performance
+torch.backends.cuda.enable_flash_sdp(True)
+
+# Use relative imports for submodule compatibility
+from .flashdepth.model import FlashDepth
+from .dataloaders.depthanything_preprocess import depthanything_preprocess
 
 
 class FlashDepthPipeline:
@@ -51,6 +55,7 @@ class FlashDepthPipeline:
         use_mamba: bool = False,
         device: str = "cuda",
         compile_model: bool = False,
+        use_bfloat16: bool = True,
     ):
         """
         Initialize the FlashDepth inference pipeline.
@@ -61,10 +66,13 @@ class FlashDepthPipeline:
             use_mamba: Whether to use Mamba temporal module (for video sequences)
             device: Device to run inference on ("cuda" or "cpu")
             compile_model: Whether to use torch.compile for speedup (requires PyTorch 2.0+)
+            use_bfloat16: Whether to use bfloat16 precision (default True for better performance)
         """
         self.device = device
         self.use_mamba = use_mamba
         self.model_size = model_size
+        self.use_bfloat16 = use_bfloat16
+        self.dtype = torch.bfloat16 if use_bfloat16 else torch.float32
 
         # Initialize model
         logging.info(f"Initializing FlashDepth with {model_size} encoder...")
@@ -101,14 +109,35 @@ class FlashDepthPipeline:
 
         self.model.load_state_dict(state_dict, strict=False)
         self.model = self.model.to(device)
+
+        # Convert model to bfloat16 if requested
+        if use_bfloat16:
+            logging.info("Converting model to bfloat16...")
+            self.model = self.model.to(dtype=torch.bfloat16)
+
         self.model.eval()
 
-        # Optionally compile model for faster inference
-        if compile_model:
-            logging.info("Compiling model with torch.compile...")
-            self.model = torch.compile(self.model)
+        # Create a compilable inference function
+        def _inference_fn(frame, patch_h, patch_w):
+            """Compilable inference path without control flow."""
+            B, C, H, W = frame.shape
+            dpt_features = self.model.get_dpt_features(frame, input_shape=(B, C, H, W))
+            depth_pred = self.model.final_head(dpt_features, patch_h, patch_w)
+            return torch.clip(depth_pred, min=0)
 
-        logging.info("Pipeline initialized successfully!")
+        # Optionally compile the inference function
+        if compile_model:
+            logging.info("Compiling inference function with torch.compile (mode=max-autotune)...")
+            self._inference_fn = torch.compile(
+                _inference_fn,
+                mode='max-autotune',
+                dynamic=False,
+                fullgraph=True
+            )
+        else:
+            self._inference_fn = _inference_fn
+
+        logging.info(f"Pipeline initialized successfully! (dtype: {self.dtype})")
 
     def preprocess_image(
         self,
@@ -156,8 +185,11 @@ class FlashDepthPipeline:
         )
 
         # Add batch dimension: (3, H, W) -> (1, 3, H, W)
-        # Ensure float32 dtype
-        image_tensor = image_tensor.float().unsqueeze(0)
+        # Convert to appropriate dtype (float32 or bfloat16)
+        if self.use_bfloat16:
+            image_tensor = image_tensor.to(dtype=torch.bfloat16).unsqueeze(0)
+        else:
+            image_tensor = image_tensor.float().unsqueeze(0)
 
         return image_tensor
 
@@ -199,15 +231,15 @@ class FlashDepthPipeline:
         frame = image_tensor[:, 0, :, :, :]  # (1, 3, H, W)
         patch_h, patch_w = H // self.model.patch_size, W // self.model.patch_size
 
-        # Get DPT features
-        dpt_features = self.model.get_dpt_features(frame, input_shape=(B, C, H, W))
-
-        # Get depth prediction
-        depth_pred = self.model.final_head(dpt_features, patch_h, patch_w)
-        depth_pred = torch.clip(depth_pred, min=0)
+        # Run compiled inference function
+        depth_pred = self._inference_fn(frame, patch_h, patch_w)
 
         # Remove batch dimension: (1, H, W) -> (H, W)
         depth_pred = depth_pred.squeeze(0)
+
+        # Convert back to float32 for compatibility with numpy/visualization
+        if self.use_bfloat16:
+            depth_pred = depth_pred.float()
 
         if return_numpy:
             return depth_pred.cpu().numpy()
