@@ -83,7 +83,8 @@ class MemEffAttention(Attention):
         return x
 
 
-from flash_attn import flash_attn_func
+import torch.nn.functional as F
+
 class CrossAttention(nn.Module):
     def __init__(
         self,
@@ -113,21 +114,27 @@ class CrossAttention(nn.Module):
             context: Key/Value input of shape (B, M, C)
             attn_bias: Optional attention bias tensor
         """
- 
+
         B, N, C = x.shape
         _, M, _ = context.shape
 
         # Project and reshape q to [B, N, num_heads, head_dim]
         q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads)
-        
+
         # Project and reshape kv to [B, M, 2, num_heads, head_dim]
         kv = self.kv(context).reshape(B, M, 2, self.num_heads, C // self.num_heads)
-        k, v = unbind(kv, 2)  
+        k, v = unbind(kv, 2)
 
-        #x = memory_efficient_attention(q, k, v)
-        x = flash_attn_func(q,k,v) # flash attention allows different sequence length for q and k without mask
-       
-        x = x.reshape(B, N, C)
+        # Use PyTorch's native scaled_dot_product_attention
+        # Transpose to [B, num_heads, seq_len, head_dim] format
+        q = q.transpose(1, 2)  # [B, num_heads, N, head_dim]
+        k = k.transpose(1, 2)  # [B, num_heads, M, head_dim]
+        v = v.transpose(1, 2)  # [B, num_heads, M, head_dim]
+
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+
+        # Transpose back to [B, N, num_heads, head_dim] and reshape
+        x = x.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
         return x
