@@ -56,7 +56,7 @@ model.eval()
 # Compile the inference function
 print("Compiling inference function with torch.compile (mode=max-autotune)...")
 print("NOTE: First run will be slow due to compilation")
-model.compile(mode='max-autotune', dynamic=False)
+#model.compile(mode='max-autotune', dynamic=False)
 
 # Warmup run
 print("\n" + "-"*70)
